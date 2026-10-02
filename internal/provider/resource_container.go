@@ -16,6 +16,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ type ContainerResource struct {
 }
 
 type ContainerResourceModel struct {
+	ID                        types.String `tfsdk:"id"`
 	Name                      types.String `tfsdk:"name"`
 	IsSpot                    types.Bool   `tfsdk:"is_spot"`
 	Compute                   types.Object `tfsdk:"compute"`
@@ -64,7 +66,6 @@ type ScalingModel struct {
 	MinReplicaCount              types.Int64  `tfsdk:"min_replica_count"`
 	MaxReplicaCount              types.Int64  `tfsdk:"max_replica_count"`
 	QueueMessageTTLSeconds       types.Int64  `tfsdk:"queue_message_ttl_seconds"`
-	DeadlineSeconds              types.Int64  `tfsdk:"deadline_seconds"`
 	ConcurrentRequestsPerReplica types.Int64  `tfsdk:"concurrent_requests_per_replica"`
 	ScaleDownPolicy              types.Object `tfsdk:"scale_down_policy"`
 	ScaleUpPolicy                types.Object `tfsdk:"scale_up_policy"`
@@ -128,6 +129,10 @@ func (r *ContainerResource) Schema(ctx context.Context, req resource.SchemaReque
 		MarkdownDescription: "Manages a Verda container deployment for serverless workloads",
 
 		Attributes: map[string]schema.Attribute{
+			"id": schema.StringAttribute{
+				MarkdownDescription: "Stable deployment ID (the deployment name)",
+				Computed:            true,
+			},
 			"name": schema.StringAttribute{
 				MarkdownDescription: "Name of the container deployment",
 				Required:            true,
@@ -169,10 +174,6 @@ func (r *ContainerResource) Schema(ctx context.Context, req resource.SchemaReque
 					"queue_message_ttl_seconds": schema.Int64Attribute{
 						MarkdownDescription: "Queue message TTL in seconds",
 						Required:            true,
-					},
-					"deadline_seconds": schema.Int64Attribute{
-						MarkdownDescription: "Request deadline in seconds",
-						Optional:            true,
 					},
 					"concurrent_requests_per_replica": schema.Int64Attribute{
 						MarkdownDescription: "Maximum concurrent requests per replica",
@@ -619,6 +620,10 @@ func (r *ContainerResource) Read(ctx context.Context, req resource.ReadRequest, 
 
 	deployment, err := r.client.ContainerDeployments.GetDeploymentByName(ctx, data.Name.ValueString())
 	if err != nil {
+		if isNotFound(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read container deployment, got error: %s", err))
 		return
 	}
@@ -647,18 +652,198 @@ func (r *ContainerResource) Read(ctx context.Context, req resource.ReadRequest, 
 
 func (r *ContainerResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var data ContainerResourceModel
+	var prior ContainerResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 
 	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	// Container deployments cannot be updated, only deleted and recreated
-	resp.Diagnostics.AddError(
-		"Update Not Supported",
-		"Container deployments cannot be updated. Please delete and recreate the resource with new values.",
-	)
+	patch := &verda.UpdateDeploymentRequest{}
+	updateDeployment := false
+	if !data.IsSpot.Equal(prior.IsSpot) {
+		isSpot := data.IsSpot.ValueBool()
+		patch.IsSpot = &isSpot
+		updateDeployment = true
+	}
+	if !data.Compute.Equal(prior.Compute) {
+		var compute ComputeModel
+		resp.Diagnostics.Append(data.Compute.As(ctx, &compute, basetypes.ObjectAsOptions{})...)
+		patch.Compute = &verda.ContainerCompute{Name: compute.Name.ValueString(), Size: int(compute.Size.ValueInt64())}
+		updateDeployment = true
+	}
+	if !data.ContainerRegistrySettings.Equal(prior.ContainerRegistrySettings) {
+		patch.ContainerRegistrySettings = &verda.ContainerRegistrySettings{IsPrivate: false}
+		if !data.ContainerRegistrySettings.IsNull() {
+			var registry RegistrySettingsModel
+			resp.Diagnostics.Append(data.ContainerRegistrySettings.As(ctx, &registry, basetypes.ObjectAsOptions{})...)
+			patch.ContainerRegistrySettings.IsPrivate = registry.IsPrivate.ValueString() == "true"
+			if !registry.Credentials.IsNull() && registry.Credentials.ValueString() != "" {
+				patch.ContainerRegistrySettings.Credentials = &verda.RegistryCredentialsRef{Name: registry.Credentials.ValueString()}
+			}
+		}
+		updateDeployment = true
+	}
+	if !data.Containers.Equal(prior.Containers) {
+		live, err := r.client.ContainerDeployments.GetDeploymentByName(ctx, data.Name.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read container names before update: %s", err))
+			return
+		}
+		var planned []ContainerModel
+		var previous []ContainerModel
+		resp.Diagnostics.Append(data.Containers.ElementsAs(ctx, &planned, false)...)
+		resp.Diagnostics.Append(prior.Containers.ElementsAs(ctx, &previous, false)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		if len(planned) != len(live.Containers) || len(planned) != len(previous) {
+			resp.Diagnostics.AddError("Container count change not supported", "Verda's PATCH requires existing container names. To add or remove containers, replace the deployment.")
+			return
+		}
+		for i, container := range planned {
+			if container.Image.Equal(previous[i].Image) &&
+				container.ExposedPort.Equal(previous[i].ExposedPort) &&
+				container.Healthcheck.Equal(previous[i].Healthcheck) &&
+				container.EntrypointOverrides.Equal(previous[i].EntrypointOverrides) &&
+				container.Env.Equal(previous[i].Env) &&
+				container.VolumeMounts.Equal(previous[i].VolumeMounts) {
+				continue
+			}
+			updated := verda.CreateDeploymentContainer{
+				Name:  live.Containers[i].Name,
+				Image: container.Image.ValueString(),
+			}
+			if !container.ExposedPort.Equal(previous[i].ExposedPort) {
+				updated.ExposedPort = int(container.ExposedPort.ValueInt64())
+			}
+			if !container.Healthcheck.Equal(previous[i].Healthcheck) && !container.Healthcheck.IsNull() {
+				var hc HealthcheckModel
+				resp.Diagnostics.Append(container.Healthcheck.As(ctx, &hc, basetypes.ObjectAsOptions{})...)
+				updated.Healthcheck = &verda.ContainerHealthcheck{Enabled: hc.Enabled.ValueString() == "true", Path: hc.Path.ValueString()}
+				if !hc.Port.IsNull() && hc.Port.ValueString() != "" {
+					if _, err := fmt.Sscanf(hc.Port.ValueString(), "%d", &updated.Healthcheck.Port); err != nil {
+						resp.Diagnostics.AddError("Invalid healthcheck port", err.Error())
+					}
+				}
+			} else if !container.Healthcheck.Equal(previous[i].Healthcheck) {
+				updated.Healthcheck = &verda.ContainerHealthcheck{Enabled: false}
+			}
+			if !container.EntrypointOverrides.Equal(previous[i].EntrypointOverrides) && !container.EntrypointOverrides.IsNull() {
+				var overrides EntrypointOverridesModel
+				resp.Diagnostics.Append(container.EntrypointOverrides.As(ctx, &overrides, basetypes.ObjectAsOptions{})...)
+				updated.EntrypointOverrides = &verda.ContainerEntrypointOverrides{Enabled: overrides.Enabled.ValueBool()}
+				if !overrides.Entrypoint.IsNull() {
+					resp.Diagnostics.Append(overrides.Entrypoint.ElementsAs(ctx, &updated.EntrypointOverrides.Entrypoint, false)...)
+				}
+				if !overrides.Cmd.IsNull() {
+					resp.Diagnostics.Append(overrides.Cmd.ElementsAs(ctx, &updated.EntrypointOverrides.Cmd, false)...)
+				}
+			} else if !container.EntrypointOverrides.Equal(previous[i].EntrypointOverrides) {
+				updated.EntrypointOverrides = &verda.ContainerEntrypointOverrides{Enabled: false}
+			}
+			if !container.Env.Equal(previous[i].Env) && !container.Env.IsNull() {
+				var env []EnvVarModel
+				resp.Diagnostics.Append(container.Env.ElementsAs(ctx, &env, false)...)
+				updated.Env = make([]verda.ContainerEnvVar, 0, len(env))
+				for _, value := range env {
+					updated.Env = append(updated.Env, verda.ContainerEnvVar{Type: value.Type.ValueString(), Name: value.Name.ValueString(), ValueOrReferenceToSecret: value.ValueOrReferenceToSecret.ValueString()})
+				}
+				if len(env) == 0 && len(live.Containers[i].Env) > 0 {
+					resp.Diagnostics.AddError("Cannot clear environment variables", "The Verda Go SDK omits empty environment lists in deployment PATCH requests. Remove environment variables through Verda before applying this plan.")
+				}
+			} else if !container.Env.Equal(previous[i].Env) && len(live.Containers[i].Env) > 0 {
+				resp.Diagnostics.AddError("Cannot clear environment variables", "The Verda Go SDK omits empty environment lists in deployment PATCH requests. Remove environment variables through Verda before applying this plan.")
+			}
+			if !container.VolumeMounts.Equal(previous[i].VolumeMounts) && !container.VolumeMounts.IsNull() {
+				var mounts []VolumeMountModel
+				resp.Diagnostics.Append(container.VolumeMounts.ElementsAs(ctx, &mounts, false)...)
+				updated.VolumeMounts = make([]verda.ContainerVolumeMount, 0, len(mounts))
+				for _, mount := range mounts {
+					updated.VolumeMounts = append(updated.VolumeMounts, verda.ContainerVolumeMount{Type: mount.Type.ValueString(), MountPath: mount.MountPath.ValueString(), SecretName: mount.SecretName.ValueString(), SizeInMB: int(mount.SizeInMB.ValueInt64()), VolumeID: mount.VolumeID.ValueString()})
+				}
+				if len(mounts) == 0 && len(live.Containers[i].VolumeMounts) > 0 {
+					resp.Diagnostics.AddError("Cannot clear volume mounts", "The Verda Go SDK omits empty volume mount lists in deployment PATCH requests. Replace the deployment to remove all mounts.")
+				}
+			} else if !container.VolumeMounts.Equal(previous[i].VolumeMounts) && len(live.Containers[i].VolumeMounts) > 0 {
+				resp.Diagnostics.AddError("Cannot clear volume mounts", "The Verda Go SDK omits empty volume mount lists in deployment PATCH requests. Replace the deployment to remove all mounts.")
+			}
+			patch.Containers = append(patch.Containers, updated)
+		}
+		updateDeployment = updateDeployment || len(patch.Containers) > 0
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if updateDeployment {
+		if _, err := r.client.ContainerDeployments.UpdateDeployment(ctx, data.Name.ValueString(), patch); err != nil {
+			resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update container deployment: %s", err))
+			return
+		}
+	}
+	if !data.Scaling.Equal(prior.Scaling) {
+		updateScaling(ctx, r.client, data.Name.ValueString(), data.Scaling, &resp.Diagnostics)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	deployment, err := r.client.ContainerDeployments.GetDeploymentByName(ctx, data.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read updated container deployment: %s", err))
+		return
+	}
+	scaling, err := r.client.ContainerDeployments.GetDeploymentScaling(ctx, data.Name.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to read updated scaling: %s", err))
+		return
+	}
+	plannedContainers := data.Containers
+	r.flattenDeploymentToModel(ctx, deployment, &data, &resp.Diagnostics)
+	r.flattenScalingToModel(ctx, scaling, &data, &resp.Diagnostics)
+	r.mergeContainersFromPlan(ctx, plannedContainers, &data, &resp.Diagnostics)
+	if !resp.Diagnostics.HasError() {
+		resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
+	}
+}
+
+func updateScaling(ctx context.Context, client *verda.Client, name string, value types.Object, diagnostics *diag.Diagnostics) {
+	patch := buildScalingPatch(ctx, value, diagnostics)
+	if diagnostics.HasError() {
+		return
+	}
+	if _, err := client.ContainerDeployments.UpdateDeploymentScaling(ctx, name, patch); err != nil {
+		diagnostics.AddError("Client Error", fmt.Sprintf("Unable to update deployment scaling: %s", err))
+	}
+}
+
+func buildScalingPatch(ctx context.Context, value types.Object, diagnostics *diag.Diagnostics) *verda.UpdateScalingOptionsRequest {
+	var scaling ScalingModel
+	diagnostics.Append(value.As(ctx, &scaling, basetypes.ObjectAsOptions{})...)
+	if diagnostics.HasError() {
+		return nil
+	}
+	minReplicas := int(scaling.MinReplicaCount.ValueInt64())
+	maxReplicas := int(scaling.MaxReplicaCount.ValueInt64())
+	ttl := int(scaling.QueueMessageTTLSeconds.ValueInt64())
+	concurrency := int(scaling.ConcurrentRequestsPerReplica.ValueInt64())
+	patch := &verda.UpdateScalingOptionsRequest{
+		MinReplicaCount: &minReplicas, MaxReplicaCount: &maxReplicas,
+		QueueMessageTTLSeconds: &ttl, ConcurrentRequestsPerReplica: &concurrency,
+	}
+	var down, up ScalingPolicyModel
+	var queue QueueLoadTriggerModel
+	diagnostics.Append(scaling.ScaleDownPolicy.As(ctx, &down, basetypes.ObjectAsOptions{})...)
+	diagnostics.Append(scaling.ScaleUpPolicy.As(ctx, &up, basetypes.ObjectAsOptions{})...)
+	diagnostics.Append(scaling.QueueLoad.As(ctx, &queue, basetypes.ObjectAsOptions{})...)
+	if diagnostics.HasError() {
+		return nil
+	}
+	patch.ScaleDownPolicy = &verda.ScalingPolicy{DelaySeconds: int(down.DelaySeconds.ValueInt64())}
+	patch.ScaleUpPolicy = &verda.ScalingPolicy{DelaySeconds: int(up.DelaySeconds.ValueInt64())}
+	patch.ScalingTriggers = &verda.ScalingTriggers{QueueLoad: &verda.QueueLoadTrigger{Threshold: queue.Threshold.ValueFloat64()}}
+	return patch
 }
 
 func (r *ContainerResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -672,6 +857,9 @@ func (r *ContainerResource) Delete(ctx context.Context, req resource.DeleteReque
 
 	// Initiate deletion (ignore timeout errors as we'll poll instead)
 	err := r.client.ContainerDeployments.DeleteDeployment(ctx, data.Name.ValueString(), 60000)
+	if isNotFound(err) {
+		return
+	}
 	if err != nil && !isTimeoutError(err) {
 		resp.Diagnostics.AddError("Client Error", fmt.Sprintf("Unable to delete container deployment, got error: %s", err))
 		return
@@ -686,14 +874,23 @@ func (r *ContainerResource) Delete(ctx context.Context, req resource.DeleteReque
 
 func (r *ContainerResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+}
+
+func isNotFound(err error) bool {
+	var apiErr *verda.APIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == 404
 }
 
 func isTimeoutError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errStr := err.Error()
-	return strings.Contains(errStr, "504") || strings.Contains(strings.ToLower(errStr), "timeout")
+	var apiErr *verda.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == 504 {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout")
 }
 
 func (r *ContainerResource) waitForDeletionComplete(ctx context.Context, deploymentName string, timeoutSeconds int) error {
@@ -708,22 +905,24 @@ func (r *ContainerResource) waitForDeletionComplete(ctx context.Context, deploym
 		// Try to get the deployment
 		_, err := r.client.ContainerDeployments.GetDeploymentByName(ctx, deploymentName)
 		if err != nil {
-			// Check if it's a 404 error (deployment not found = successfully deleted)
-			errStr := err.Error()
-			if strings.Contains(errStr, "404") || strings.Contains(strings.ToLower(errStr), "not found") {
+			if isNotFound(err) {
 				return nil
 			}
 			// For other errors, continue polling (deployment might be in transition)
 		}
 
-		// Wait 10 seconds before trying again
-		time.Sleep(10 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Second):
+		}
 	}
 
 	return fmt.Errorf("timeout after %d seconds waiting for deployment deletion", timeoutSeconds)
 }
 
 func (r *ContainerResource) flattenDeploymentToModel(ctx context.Context, deployment *verda.ContainerDeployment, data *ContainerResourceModel, diagnostics *diag.Diagnostics) {
+	data.ID = types.StringValue(deployment.Name)
 	data.Name = types.StringValue(deployment.Name)
 	data.IsSpot = types.BoolValue(deployment.IsSpot)
 	data.EndpointBaseURL = types.StringValue(deployment.EndpointBaseURL)
@@ -814,10 +1013,16 @@ func (r *ContainerResource) mergeContainersFromPlan(ctx context.Context, planCon
 		// Use plan volume_mounts since API doesn't return all fields (like volume_id for non-shared)
 		mergedContainer := apiContainer
 		mergedContainer.VolumeMounts = planContainer.VolumeMounts
+		if planContainer.Healthcheck.IsNull() {
+			mergedContainer.Healthcheck = planContainer.Healthcheck
+		}
+		if planContainer.Env.IsNull() {
+			mergedContainer.Env = planContainer.Env
+		}
 
-		// Also preserve entrypoint_overrides from plan if API didn't return it
-		if (apiContainer.EntrypointOverrides.IsNull() || apiContainer.EntrypointOverrides.IsUnknown()) &&
-			!planContainer.EntrypointOverrides.IsNull() {
+		// Unconfigured entrypoints are not managed; preserve configured values if the API omits them.
+		if planContainer.EntrypointOverrides.IsNull() ||
+			apiContainer.EntrypointOverrides.IsNull() || apiContainer.EntrypointOverrides.IsUnknown() {
 			mergedContainer.EntrypointOverrides = planContainer.EntrypointOverrides
 		}
 
@@ -1216,6 +1421,11 @@ func (r *ContainerResource) flattenContainersToModel(ctx context.Context, contai
 }
 
 func (r *ContainerResource) flattenScalingToModel(ctx context.Context, scalingConfig *verda.ContainerScalingOptions, data *ContainerResourceModel, diagnostics *diag.Diagnostics) {
+	if scalingConfig == nil || scalingConfig.ScaleDownPolicy == nil || scalingConfig.ScaleUpPolicy == nil ||
+		scalingConfig.ScalingTriggers == nil || scalingConfig.ScalingTriggers.QueueLoad == nil {
+		diagnostics.AddError("Incomplete scaling response", "Verda did not return the scale policies and queue trigger required by the container resource.")
+		return
+	}
 	scaleDownPolicyObj, diags := types.ObjectValue(
 		map[string]attr.Type{
 			"delay_seconds": types.Int64Type,
@@ -1251,7 +1461,6 @@ func (r *ContainerResource) flattenScalingToModel(ctx context.Context, scalingCo
 			"min_replica_count":               types.Int64Type,
 			"max_replica_count":               types.Int64Type,
 			"queue_message_ttl_seconds":       types.Int64Type,
-			"deadline_seconds":                types.Int64Type,
 			"concurrent_requests_per_replica": types.Int64Type,
 			"scale_down_policy": types.ObjectType{
 				AttrTypes: map[string]attr.Type{
@@ -1273,7 +1482,6 @@ func (r *ContainerResource) flattenScalingToModel(ctx context.Context, scalingCo
 			"min_replica_count":               types.Int64Value(int64(scalingConfig.MinReplicaCount)),
 			"max_replica_count":               types.Int64Value(int64(scalingConfig.MaxReplicaCount)),
 			"queue_message_ttl_seconds":       types.Int64Value(int64(scalingConfig.QueueMessageTTLSeconds)),
-			"deadline_seconds":                types.Int64Value(int64(scalingConfig.QueueMessageTTLSeconds)),
 			"concurrent_requests_per_replica": types.Int64Value(int64(scalingConfig.ConcurrentRequestsPerReplica)),
 			"scale_down_policy":               scaleDownPolicyObj,
 			"scale_up_policy":                 scaleUpPolicyObj,

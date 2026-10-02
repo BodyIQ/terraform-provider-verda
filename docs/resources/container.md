@@ -198,6 +198,7 @@ resource "verda_container" "trainer" {
 
 - `created_at` (String) Creation timestamp in ISO 8601 format.
 - `endpoint_base_url` (String) Base URL for the deployment endpoint.
+- `id` (String) Stable deployment ID (the deployment name).
 
 <a id="nestedatt--compute"></a>
 ### Nested Schema for `compute`
@@ -281,10 +282,6 @@ Required:
 - `queue_message_ttl_seconds` (Number) Request queue TTL in seconds.
 - `scale_down_policy` (Attributes) Scale down configuration. See [below](#nestedatt--scaling--scale_down_policy).
 - `scale_up_policy` (Attributes) Scale up configuration. See [below](#nestedatt--scaling--scale_up_policy).
-
-Optional:
-
-- `deadline_seconds` (Number) Request timeout in seconds.
 
 <a id="nestedatt--scaling--queue_load"></a>
 ### Nested Schema for `scaling.queue_load`

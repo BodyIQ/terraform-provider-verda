@@ -14,7 +14,6 @@ resource "verda_container" "test" {
     min_replica_count               = 1
     max_replica_count               = 5
     queue_message_ttl_seconds       = 3600
-    deadline_seconds                = 3600
     concurrent_requests_per_replica = 10
 
     scale_down_policy = {

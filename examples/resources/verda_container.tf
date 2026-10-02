@@ -12,7 +12,6 @@ resource "verda_container" "example" {
     min_replica_count               = 1
     max_replica_count               = 5
     queue_message_ttl_seconds       = 3600
-    deadline_seconds                = 3600
     concurrent_requests_per_replica = 10
 
     scale_down_policy = {
@@ -57,7 +56,6 @@ resource "verda_container" "with_env" {
     min_replica_count               = 2
     max_replica_count               = 10
     queue_message_ttl_seconds       = 7200
-    deadline_seconds                = 7200
     concurrent_requests_per_replica = 20
 
     scale_down_policy = {
@@ -120,7 +118,6 @@ resource "verda_container" "with_healthcheck" {
     min_replica_count               = 1
     max_replica_count               = 10
     queue_message_ttl_seconds       = 1800
-    deadline_seconds                = 1800
     concurrent_requests_per_replica = 15
 
     scale_down_policy = {
@@ -203,7 +200,6 @@ resource "verda_container" "with_private_registry" {
     min_replica_count               = 1
     max_replica_count               = 3
     queue_message_ttl_seconds       = 3600
-    deadline_seconds                = 3600
     concurrent_requests_per_replica = 5
 
     scale_down_policy = {
@@ -252,7 +248,6 @@ resource "verda_container" "with_shared_volume" {
     min_replica_count               = 1
     max_replica_count               = 5
     queue_message_ttl_seconds       = 3600
-    deadline_seconds                = 3600
     concurrent_requests_per_replica = 10
 
     scale_down_policy = {
