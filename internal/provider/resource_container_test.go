@@ -25,9 +25,12 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/verda-cloud/verdacloud-sdk-go/pkg/verda"
 )
 
@@ -128,5 +131,100 @@ func TestScalingPatchUsesDedicatedEndpoint(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestContainerImageUpdatePreservesUnmanagedEntrypoint(t *testing.T) {
+	ctx := context.Background()
+	var patched map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/oauth2/token":
+			_, _ = w.Write([]byte(`{"access_token":"test","token_type":"Bearer","expires_in":3600,"refresh_token":"test"}`))
+		case r.URL.Path == "/container-deployments/test-model/scaling":
+			_, _ = w.Write([]byte(`{"min_replica_count":0,"max_replica_count":1,"queue_message_ttl_seconds":3600,"concurrent_requests_per_replica":1,"scale_down_policy":{"delay_seconds":30},"scale_up_policy":{"delay_seconds":0},"scaling_triggers":{"queue_load":{"threshold":1}}}`))
+		case r.URL.Path == "/container-deployments/test-model":
+			if r.Method == http.MethodPatch {
+				if err := json.NewDecoder(r.Body).Decode(&patched); err != nil {
+					t.Errorf("invalid patch: %s", err)
+				}
+			}
+			image := "image:old"
+			if patched != nil {
+				image = "image:new"
+			}
+			_, _ = w.Write([]byte(`{"name":"test-model","containers":[{"name":"c0","image":{"image":"` + image + `"},"exposed_port":5000,"entrypoint_overrides":{"enabled":true,"entrypoint":["/bin/cog"],"cmd":["serve"]},"env":[],"volume_mounts":[]}],"endpoint_base_url":"https://example.invalid/","created_at":"2026-10-01T00:00:00Z","compute":{"name":"H100","size":1},"container_registry_settings":{"is_private":false},"is_spot":false}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "not found", http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, err := verda.NewClient(verda.WithBaseURL(server.URL), verda.WithClientID("test"), verda.WithClientSecret("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schemaResp resource.SchemaResponse
+	r := &ContainerResource{client: client}
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	s := schemaResp.Schema
+	makeState := func(image string) tfsdk.State {
+		compute := types.ObjectValueMust(map[string]attr.Type{"name": types.StringType, "size": types.Int64Type}, map[string]attr.Value{"name": types.StringValue("H100"), "size": types.Int64Value(1)})
+		down := types.ObjectValueMust(map[string]attr.Type{"delay_seconds": types.Int64Type}, map[string]attr.Value{"delay_seconds": types.Int64Value(30)})
+		up := types.ObjectValueMust(map[string]attr.Type{"delay_seconds": types.Int64Type}, map[string]attr.Value{"delay_seconds": types.Int64Value(0)})
+		queue := types.ObjectValueMust(map[string]attr.Type{"threshold": types.Float64Type}, map[string]attr.Value{"threshold": types.Float64Value(1)})
+		scaling := types.ObjectValueMust(map[string]attr.Type{
+			"min_replica_count": types.Int64Type, "max_replica_count": types.Int64Type,
+			"queue_message_ttl_seconds": types.Int64Type, "concurrent_requests_per_replica": types.Int64Type,
+			"scale_down_policy": down.Type(ctx), "scale_up_policy": up.Type(ctx), "queue_load": queue.Type(ctx),
+		}, map[string]attr.Value{
+			"min_replica_count": types.Int64Value(0), "max_replica_count": types.Int64Value(1),
+			"queue_message_ttl_seconds": types.Int64Value(3600), "concurrent_requests_per_replica": types.Int64Value(1),
+			"scale_down_policy": down, "scale_up_policy": up, "queue_load": queue,
+		})
+		containerType := s.Attributes["containers"].GetType().(types.ListType).ElemType.(types.ObjectType)
+		container := types.ObjectValueMust(containerType.AttrTypes, map[string]attr.Value{
+			"image": types.StringValue(image), "exposed_port": types.Int64Value(5000),
+			"healthcheck":          types.ObjectNull(containerType.AttrTypes["healthcheck"].(types.ObjectType).AttrTypes),
+			"entrypoint_overrides": types.ObjectNull(containerType.AttrTypes["entrypoint_overrides"].(types.ObjectType).AttrTypes),
+			"env":                  types.ListNull(containerType.AttrTypes["env"].(types.ListType).ElemType),
+			"volume_mounts":        types.ListNull(containerType.AttrTypes["volume_mounts"].(types.ListType).ElemType),
+		})
+		containers := types.ListValueMust(containerType, []attr.Value{container})
+		registry := types.ObjectValueMust(map[string]attr.Type{"is_private": types.StringType, "credentials": types.StringType}, map[string]attr.Value{"is_private": types.StringValue("false"), "credentials": types.StringNull()})
+		model := ContainerResourceModel{
+			ID: types.StringValue("test-model"), Name: types.StringValue("test-model"), IsSpot: types.BoolValue(false),
+			Compute: compute, Scaling: scaling, ContainerRegistrySettings: registry, Containers: containers,
+			EndpointBaseURL: types.StringValue("https://example.invalid/"), CreatedAt: types.StringValue("2026-10-01T00:00:00Z"),
+		}
+		state := tfsdk.State{Schema: s, Raw: tftypes.NewValue(s.Type().TerraformType(ctx), nil)}
+		if diags := state.Set(ctx, &model); diags.HasError() {
+			t.Fatalf("building state: %v", diags)
+		}
+		return state
+	}
+	prior := makeState("image:old")
+	plan := makeState("image:new")
+	response := resource.UpdateResponse{State: tfsdk.State{Schema: s, Raw: plan.Raw}}
+	r.Update(ctx, resource.UpdateRequest{Plan: tfsdk.Plan{Schema: s, Raw: plan.Raw}, State: prior}, &response)
+	if response.Diagnostics.HasError() {
+		t.Fatalf("update failed: %v", response.Diagnostics)
+	}
+	if patched == nil {
+		t.Fatal("deployment was not patched")
+	}
+	containersPatch := patched["containers"].([]any)
+	updated := containersPatch[0].(map[string]any)
+	if updated["name"] != "c0" || updated["image"] != "image:new" {
+		t.Errorf("wrong container patch: %v", updated)
+	}
+	if _, ok := updated["entrypoint_overrides"]; ok {
+		t.Errorf("image update must not overwrite Cog entrypoint: %v", updated)
+	}
+	var id types.String
+	response.State.GetAttribute(ctx, path.Root("id"), &id)
+	if id.ValueString() != "test-model" {
+		t.Errorf("stable ID = %q", id.ValueString())
 	}
 }
